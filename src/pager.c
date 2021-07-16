@@ -4665,7 +4665,7 @@ int sqlite3PagerOpen(
   int rc = SQLITE_OK;      /* Return code */
   int tempFile = 0;        /* True for temp files (incl. in-memory files) */
   int memDb = 0;           /* True if this is an in-memory file */
-#ifdef SQLITE_ENABLE_DESERIALIZE
+#ifndef SQLITE_OMIT_DESERIALIZE
   int memJM = 0;           /* Memory journal mode */
 #else
 # define memJM 0
@@ -4869,7 +4869,7 @@ int sqlite3PagerOpen(
     int fout = 0;                    /* VFS flags returned by xOpen() */
     rc = sqlite3OsOpen(pVfs, pPager->zFilename, pPager->fd, vfsFlags, &fout);
     assert( !memDb );
-#ifdef SQLITE_ENABLE_DESERIALIZE
+#ifndef SQLITE_OMIT_DESERIALIZE
     memJM = (fout&SQLITE_OPEN_MEMORY)!=0;
 #endif
     readOnly = (fout&SQLITE_OPEN_READONLY)!=0;
@@ -5837,7 +5837,7 @@ int sqlite3PagerBegin(Pager *pPager, int exFlag, int subjInMemory){
   assert( pPager->eState>=PAGER_READER && pPager->eState<PAGER_ERROR );
   pPager->subjInMemory = (u8)subjInMemory;
 
-  if( ALWAYS(pPager->eState==PAGER_READER) ){
+  if( pPager->eState==PAGER_READER ){
     assert( pPager->pInJournal==0 );
 
     if( pagerUseWal(pPager) ){
@@ -7327,7 +7327,7 @@ int sqlite3PagerSetJournalMode(Pager *pPager, int eMode){
           assert( rc==SQLITE_OK );
           rc = pagerLockDb(pPager, RESERVED_LOCK);
         }
-        if( rc==SQLITE_OK && pPager->pVfs->xDelete!=0 ){
+        if( rc==SQLITE_OK ){
           sqlite3OsDelete(pPager->pVfs, pPager->zJournal, 0);
         }
         if( rc==SQLITE_OK && state==PAGER_READER ){

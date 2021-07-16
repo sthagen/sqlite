@@ -193,7 +193,7 @@ ifnotexists(A) ::= .              {A = 0;}
 ifnotexists(A) ::= IF NOT EXISTS. {A = 1;}
 %type temp {int}
 %ifndef SQLITE_OMIT_TEMPDB
-temp(A) ::= TEMP.  {A = 1;}
+temp(A) ::= TEMP.  {A = pParse->db->init.busy==0;}
 %endif  SQLITE_OMIT_TEMPDB
 temp(A) ::= .      {A = 0;}
 create_table_args ::= LP columnlist conslist_opt(X) RP(E) table_options(F). {
@@ -1254,20 +1254,28 @@ expr(A) ::= expr(A) between_op(N) expr(X) AND expr(Y). [BETWEEN] {
       */
       sqlite3ExprUnmapAndDelete(pParse, A);
       A = sqlite3Expr(pParse->db, TK_INTEGER, N ? "1" : "0");
-    }else if( Y->nExpr==1 && sqlite3ExprIsConstant(Y->a[0].pExpr) ){
-      Expr *pRHS = Y->a[0].pExpr;
-      Y->a[0].pExpr = 0;
-      sqlite3ExprListDelete(pParse->db, Y);
-      pRHS = sqlite3PExpr(pParse, TK_UPLUS, pRHS, 0);
-      A = sqlite3PExpr(pParse, TK_EQ, A, pRHS);
-      if( N ) A = sqlite3PExpr(pParse, TK_NOT, A, 0);
     }else{
-      A = sqlite3PExpr(pParse, TK_IN, A, 0);
-      if( A ){
-        A->x.pList = Y;
-        sqlite3ExprSetHeightAndFlags(pParse, A);
-      }else{
+      Expr *pRHS = Y->a[0].pExpr;
+      if( Y->nExpr==1 && sqlite3ExprIsConstant(pRHS) && A->op!=TK_VECTOR ){
+        Y->a[0].pExpr = 0;
         sqlite3ExprListDelete(pParse->db, Y);
+        pRHS = sqlite3PExpr(pParse, TK_UPLUS, pRHS, 0);
+        A = sqlite3PExpr(pParse, TK_EQ, A, pRHS);
+      }else{
+        A = sqlite3PExpr(pParse, TK_IN, A, 0);
+        if( A==0 ){
+          sqlite3ExprListDelete(pParse->db, Y);
+        }else if( A->pLeft->op==TK_VECTOR ){
+          int nExpr = A->pLeft->x.pList->nExpr;
+          Select *pSelectRHS = sqlite3ExprListToValues(pParse, nExpr, Y);
+          if( pSelectRHS ){
+            parserDoubleLinkSelect(pParse, pSelectRHS);
+            sqlite3PExprAddSelect(pParse, A, pSelectRHS);
+          }
+        }else{
+          A->x.pList = Y;
+          sqlite3ExprSetHeightAndFlags(pParse, A);
+        }
       }
       if( N ) A = sqlite3PExpr(pParse, TK_NOT, A, 0);
     }
@@ -1801,7 +1809,11 @@ frame_exclude(A) ::= GROUP|TIES(X).  {A = @X; /*A-overwrites-X*/}
 window_clause(A) ::= WINDOW windowdefn_list(B). { A = B; }
 
 filter_over(A) ::= filter_clause(F) over_clause(O). {
-  O->pFilter = F;
+  if( O ){
+    O->pFilter = F;
+  }else{
+    sqlite3ExprDelete(pParse->db, F);
+  }
   A = O;
 }
 filter_over(A) ::= over_clause(O). {
@@ -1851,6 +1863,7 @@ filter_clause(A) ::= FILTER LP WHERE expr(X) RP.  { A = X; }
   IF_NULL_ROW     /* the if-null-row operator */
   ASTERISK        /* The "*" in count(*) and similar */
   SPAN            /* The span operator */
+  ERROR           /* An expression containing an error */
 .
 /* There must be no more than 255 tokens defined above.  If this grammar
 ** is extended with new rules and tokens, they must either be so few in

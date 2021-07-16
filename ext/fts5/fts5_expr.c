@@ -135,6 +135,7 @@ void sqlite3Fts5ParseError(Fts5Parse *pParse, const char *zFmt, ...){
   va_list ap;
   va_start(ap, zFmt);
   if( pParse->rc==SQLITE_OK ){
+    assert( pParse->zErr==0 );
     pParse->zErr = sqlite3_vmprintf(zFmt, ap);
     pParse->rc = SQLITE_ERROR;
   }
@@ -2144,9 +2145,8 @@ void sqlite3Fts5ParseSetColset(
 ){
   Fts5Colset *pFree = pColset;
   if( pParse->pConfig->eDetail==FTS5_DETAIL_NONE ){
-    pParse->rc = SQLITE_ERROR;
-    pParse->zErr = sqlite3_mprintf(
-      "fts5: column queries are not supported (detail=none)"
+    sqlite3Fts5ParseError(pParse, 
+        "fts5: column queries are not supported (detail=none)"
     );
   }else{
     fts5ParseSetColset(pParse, pExpr, pColset, &pFree);
@@ -2320,13 +2320,10 @@ Fts5ExprNode *sqlite3Fts5ParseNode(
                 || pPhrase->nTerm>1
                 || (pPhrase->nTerm>0 && pPhrase->aTerm[0].bFirst)
               ){
-              assert( pParse->rc==SQLITE_OK );
-              pParse->rc = SQLITE_ERROR;
-              assert( pParse->zErr==0 );
-              pParse->zErr = sqlite3_mprintf(
+              sqlite3Fts5ParseError(pParse, 
                   "fts5: %s queries are not supported (detail!=full)", 
                   pNear->nPhrase==1 ? "phrase": "NEAR"
-                  );
+              );
               sqlite3_free(pRet);
               pRet = 0;
             }
@@ -2412,6 +2409,7 @@ Fts5ExprNode *sqlite3Fts5ParseImplicitAnd(
   return pRet;
 }
 
+#ifdef SQLITE_TEST
 static char *fts5ExprTermPrint(Fts5ExprTerm *pTerm){
   sqlite3_int64 nByte = 0;
   Fts5ExprTerm *p;
@@ -2778,12 +2776,14 @@ static void fts5ExprFold(
     sqlite3_result_int(pCtx, sqlite3Fts5UnicodeFold(iCode, bRemoveDiacritics));
   }
 }
+#endif /* ifdef SQLITE_TEST */
 
 /*
 ** This is called during initialization to register the fts5_expr() scalar
 ** UDF with the SQLite handle passed as the only argument.
 */
 int sqlite3Fts5ExprInit(Fts5Global *pGlobal, sqlite3 *db){
+#ifdef SQLITE_TEST
   struct Fts5ExprFunc {
     const char *z;
     void (*x)(sqlite3_context*,int,sqlite3_value**);
@@ -2801,6 +2801,10 @@ int sqlite3Fts5ExprInit(Fts5Global *pGlobal, sqlite3 *db){
     struct Fts5ExprFunc *p = &aFunc[i];
     rc = sqlite3_create_function(db, p->z, -1, SQLITE_UTF8, pCtx, p->x, 0, 0);
   }
+#else
+  int rc = SQLITE_OK;
+  UNUSED_PARAM2(pGlobal,db);
+#endif
 
   /* Avoid warnings indicating that sqlite3Fts5ParserTrace() and
   ** sqlite3Fts5ParserFallback() are unused */

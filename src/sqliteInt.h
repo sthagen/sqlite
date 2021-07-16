@@ -181,6 +181,17 @@
 # define _USE_32BIT_TIME_T
 #endif
 
+/* Optionally #include a user-defined header, whereby compilation options
+** may be set prior to where they take effect, but after platform setup. 
+** If SQLITE_CUSTOM_INCLUDE=? is defined, its value names the #include
+** file.
+*/
+#ifdef SQLITE_CUSTOM_INCLUDE
+# define INC_STRINGIFY_(f) #f
+# define INC_STRINGIFY(f) INC_STRINGIFY_(f)
+# include INC_STRINGIFY(SQLITE_CUSTOM_INCLUDE)
+#endif
+
 /* The public SQLite interface.  The _FILE_OFFSET_BITS macro must appear
 ** first in QNX.  Also, the _USE_32BIT_TIME_T macro must appear first for
 ** MinGW.
@@ -214,11 +225,12 @@
 #ifndef __has_extension
 # define __has_extension(x) 0     /* compatibility with non-clang compilers */
 #endif
-#if GCC_VERSION>=4007000 || \
-    (__has_extension(c_atomic) && __has_extension(c_atomic_store_n))
+#if GCC_VERSION>=4007000 || __has_extension(c_atomic) 
+# define SQLITE_ATOMIC_INTRINSICS 1
 # define AtomicLoad(PTR)       __atomic_load_n((PTR),__ATOMIC_RELAXED)
 # define AtomicStore(PTR,VAL)  __atomic_store_n((PTR),(VAL),__ATOMIC_RELAXED)
 #else
+# define SQLITE_ATOMIC_INTRINSICS 0
 # define AtomicLoad(PTR)       (*(PTR))
 # define AtomicStore(PTR,VAL)  (*(PTR) = (VAL))
 #endif
@@ -1522,8 +1534,8 @@ struct sqlite3 {
   u8 nSqlExec;                  /* Number of pending OP_SqlExec opcodes */
   int nextPagesize;             /* Pagesize after VACUUM if >0 */
   u32 magic;                    /* Magic number for detect library misuse */
-  int nChange;                  /* Value returned by sqlite3_changes() */
-  int nTotalChange;             /* Value returned by sqlite3_total_changes() */
+  i64 nChange;                  /* Value returned by sqlite3_changes() */
+  i64 nTotalChange;             /* Value returned by sqlite3_total_changes() */
   int aLimit[SQLITE_N_LIMIT];   /* Limits */
   int nMaxSorterMmap;           /* Maximum size of regions mapped by sorter */
   struct sqlite3InitInfo {      /* Information used during initialization */
@@ -1731,7 +1743,7 @@ struct sqlite3 {
 #define SQLITE_SkipScan       0x00004000 /* Skip-scans */
 #define SQLITE_PropagateConst 0x00008000 /* The constant propagation opt */
 #define SQLITE_MinMaxOpt      0x00010000 /* The min/max optimization */
-#define SQLITE_ExistsToIN     0x00020000 /* The EXISTS-to-IN optimization */
+#define SQLITE_SeekScan       0x00020000 /* The OP_SeekScan optimization */
 #define SQLITE_AllOpts        0xffffffff /* All optimizations */
 
 /*
@@ -2236,6 +2248,7 @@ struct Table {
 #define TF_Shadow          0x1000    /* True for a shadow table */
 #define TF_HasStat4        0x2000    /* STAT4 info available for this table */
 #define TF_Ephemeral       0x4000    /* An ephemeral table */
+#define TF_Eponymous       0x8000    /* An eponymous virtual table */
 
 /*
 ** Test to see whether or not a table is a virtual table.  This is
@@ -2948,6 +2961,7 @@ struct SrcItem {
     unsigned isRecursive :1;   /* True for recursive reference in WITH */
     unsigned fromDDL :1;       /* Comes from sqlite_schema */
     unsigned isCte :1;         /* This is a CTE */
+    unsigned notCte :1;        /* This item may not match a CTE */
   } fg;
   int iCursor;      /* The VDBE cursor number used to access this table */
   Expr *pOn;        /* The ON clause of a join */
@@ -3065,7 +3079,7 @@ struct NameContext {
   } uNC;
   NameContext *pNext;  /* Next outer name context.  NULL for outermost */
   int nRef;            /* Number of names resolved by this context */
-  int nErr;            /* Number of errors encountered while resolving names */
+  int nNcErr;          /* Number of errors encountered while resolving names */
   int ncFlags;         /* Zero or more NC_* flags defined below */
   Select *pWinSelect;  /* SELECT statement for any window functions */
 };
@@ -3098,6 +3112,7 @@ struct NameContext {
 #define NC_IsDDL     0x10000  /* Resolving names in a CREATE statement */
 #define NC_InAggFunc 0x20000  /* True if analyzing arguments to an agg func */
 #define NC_FromDDL   0x40000  /* SQL text comes from sqlite_schema */
+#define NC_NoSelect  0x80000  /* Do not descend into sub-selects */
 
 /*
 ** An instance of the following object describes a single ON CONFLICT
@@ -3207,9 +3222,10 @@ struct Select {
 #define SF_WinRewrite    0x0100000 /* Window function rewrite accomplished */
 #define SF_View          0x0200000 /* SELECT statement is a view */
 #define SF_NoopOrderBy   0x0400000 /* ORDER BY is ignored for this query */
-#define SF_UpdateFrom    0x0800000 /* Statement is an UPDATE...FROM */
+#define SF_UFSrcCheck    0x0800000 /* Check pSrc as required by UPDATE...FROM */
 #define SF_PushDown      0x1000000 /* SELECT has be modified by push-down opt */
 #define SF_MultiPart     0x2000000 /* Has multiple incompatible PARTITIONs */
+#define SF_CopyCte       0x4000000 /* SELECT statement is a copy of a CTE */
 
 /*
 ** The results of a SELECT can be distributed in several ways, as defined
@@ -3738,6 +3754,22 @@ typedef struct {
 #define INITFLAG_AlterRename   0x0001  /* Reparse after a RENAME */
 #define INITFLAG_AlterDrop     0x0002  /* Reparse after a DROP COLUMN */
 
+/* Tuning parameters are set using SQLITE_TESTCTRL_TUNE and are controlled
+** on debug-builds of the CLI using ".testctrl tune ID VALUE".  Tuning
+** parameters are for temporary use during development, to help find
+** optimial values for parameters in the query planner.  The should not
+** be used on trunk check-ins.  They are a temporary mechanism available
+** for transient development builds only.
+**
+** Tuning parameters are numbered starting with 1.
+*/
+#define SQLITE_NTUNE  6             /* Should be zero for all trunk check-ins */
+#ifdef SQLITE_DEBUG
+# define Tuning(X)  (sqlite3Config.aTune[(X)-1])
+#else
+# define Tuning(X)  0
+#endif
+
 /*
 ** Structure containing global configuration data for the SQLite library.
 **
@@ -3792,7 +3824,7 @@ struct Sqlite3Config {
   void (*xVdbeBranch)(void*,unsigned iSrcLine,u8 eThis,u8 eMx);  /* Callback */
   void *pVdbeBranchArg;                                     /* 1st argument */
 #endif
-#ifdef SQLITE_ENABLE_DESERIALIZE
+#ifndef SQLITE_OMIT_DESERIALIZE
   sqlite3_int64 mxMemdbSize;        /* Default max memdb size */
 #endif
 #ifndef SQLITE_UNTESTABLE
@@ -3802,6 +3834,10 @@ struct Sqlite3Config {
   int iOnceResetThreshold;          /* When to reset OP_Once counters */
   u32 szSorterRef;                  /* Min size in bytes to use sorter-refs */
   unsigned int iPrngSeed;           /* Alternative fixed seed for the PRNG */
+  /* vvvv--- must be last ---vvv */
+#ifdef SQLITE_DEBUG
+  sqlite3_int64 aTune[SQLITE_NTUNE]; /* Tuning parameters */
+#endif
 };
 
 /*
@@ -3879,9 +3915,16 @@ int sqlite3SelectWalkNoop(Walker*, Select*);
 int sqlite3SelectWalkFail(Walker*, Select*);
 int sqlite3WalkerDepthIncrease(Walker*,Select*);
 void sqlite3WalkerDepthDecrease(Walker*,Select*);
+void sqlite3WalkWinDefnDummyCallback(Walker*,Select*);
 
 #ifdef SQLITE_DEBUG
 void sqlite3SelectWalkAssert2(Walker*, Select*);
+#endif
+
+#ifndef SQLITE_OMIT_CTE
+void sqlite3SelectPopWith(Walker*, Select*);
+#else
+# define sqlite3SelectPopWith 0
 #endif
 
 /*
@@ -3917,6 +3960,7 @@ struct Cte {
 */
 struct With {
   int nCte;               /* Number of CTEs in the WITH clause */
+  int bView;              /* Belongs to the outermost Select of a view */
   With *pOuter;           /* Containing WITH clause, or NULL */
   Cte a[1];               /* For each CTE in the WITH clause.... */
 };
@@ -4291,6 +4335,7 @@ void sqlite3ExprDeferredDelete(Parse*, Expr*);
 void sqlite3ExprUnmapAndDelete(Parse*, Expr*);
 ExprList *sqlite3ExprListAppend(Parse*,ExprList*,Expr*);
 ExprList *sqlite3ExprListAppendVector(Parse*,ExprList*,IdList*,Expr*);
+Select *sqlite3ExprListToValues(Parse*, int, ExprList*);
 void sqlite3ExprListSetSortOrder(ExprList*,int,int);
 void sqlite3ExprListSetName(Parse*,ExprList*,Token*,int);
 void sqlite3ExprListSetSpan(Parse*,ExprList*,const char*,const char*);
@@ -4309,6 +4354,7 @@ void sqlite3ResetOneSchema(sqlite3*,int);
 void sqlite3CollapseDatabaseArray(sqlite3*);
 void sqlite3CommitInternalChanges(sqlite3*);
 void sqlite3DeleteColumnNames(sqlite3*,Table*);
+void sqlite3GenerateColumnNames(Parse *pParse, Select *pSelect);
 int sqlite3ColumnsFromExprList(Parse*,ExprList*,i16*,Column**);
 void sqlite3SelectAddColumnTypeAndCollation(Parse*,Table*,Select*,char);
 Table *sqlite3ResultSetOfSelect(Parse*,Select*,char);
@@ -4544,6 +4590,7 @@ void sqlite3RegisterPerConnectionBuiltinFunctions(sqlite3*);
 int sqlite3SafetyCheckOk(sqlite3*);
 int sqlite3SafetyCheckSickOrOk(sqlite3*);
 void sqlite3ChangeCookie(Parse*, int);
+With *sqlite3WithDup(sqlite3 *db, With *p);
 
 #if !defined(SQLITE_OMIT_VIEW) && !defined(SQLITE_OMIT_TRIGGER)
 void sqlite3MaterializeView(Parse*, Table*, Expr*, ExprList*,Expr*,int);
@@ -4687,7 +4734,7 @@ int sqlite3TwoPartName(Parse *, Token *, Token *, Token **);
 const char *sqlite3ErrName(int);
 #endif
 
-#ifdef SQLITE_ENABLE_DESERIALIZE
+#ifndef SQLITE_OMIT_DESERIALIZE
 int sqlite3MemdbInit(void);
 #endif
 
@@ -4707,7 +4754,7 @@ Expr *sqlite3ExprSkipCollateAndLikely(Expr*);
 int sqlite3CheckCollSeq(Parse *, CollSeq *);
 int sqlite3WritableSchema(sqlite3*);
 int sqlite3CheckObjectName(Parse*, const char*,const char*,const char*);
-void sqlite3VdbeSetChanges(sqlite3 *, int);
+void sqlite3VdbeSetChanges(sqlite3 *, i64);
 int sqlite3AddInt64(i64*,i64);
 int sqlite3SubInt64(i64*,i64);
 int sqlite3MulInt64(i64*,i64);
@@ -4954,7 +5001,7 @@ const char *sqlite3JournalModename(int);
   void sqlite3CteDelete(sqlite3*,Cte*);
   With *sqlite3WithAdd(Parse*,With*,Cte*);
   void sqlite3WithDelete(sqlite3*,With*);
-  void sqlite3WithPush(Parse*, With*, u8);
+  With *sqlite3WithPush(Parse*, With*, u8);
 #else
 # define sqlite3CteNew(P,T,E,S)   ((void*)0)
 # define sqlite3CteDelete(D,C)
@@ -5157,7 +5204,7 @@ int sqlite3DbstatRegister(sqlite3*);
 int sqlite3ExprVectorSize(Expr *pExpr);
 int sqlite3ExprIsVector(Expr *pExpr);
 Expr *sqlite3VectorFieldSubexpr(Expr*, int);
-Expr *sqlite3ExprForVectorField(Parse*,Expr*,int);
+Expr *sqlite3ExprForVectorField(Parse*,Expr*,int,int);
 void sqlite3VectorErrorMsg(Parse*, Expr*);
 
 #ifndef SQLITE_OMIT_COMPILEOPTION_DIAGS
